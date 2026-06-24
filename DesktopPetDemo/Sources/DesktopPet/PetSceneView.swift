@@ -27,6 +27,12 @@ final class PetSceneView: SCNView, PetRenderer {
     private(set) var currentMood: PetMood = .idle
     /// 交互意图回调：把鼠标手势翻译成与端无关的 `PetEvent` 交给上层状态机。
     var onIntent: ((PetEvent) -> Void)?
+    /// 每次物理点击（非拖动）都回调一次，用于"连点 N 次关闭"等原始计数。
+    var onRawClick: (() -> Void)?
+
+    /// 表演特殊动作（跳舞 / 穿越）时挂起眼睛跟随，避免每帧改 eulerAngles 把动作覆盖掉。
+    private var trackingSuspended = false
+    func setTrackingSuspended(_ s: Bool) { trackingSuspended = s }
 
     private var dragStartMouse: NSPoint = .zero
     private var dragStartOrigin: NSPoint = .zero
@@ -203,6 +209,7 @@ final class PetSceneView: SCNView, PetRenderer {
     // MARK: - 眼睛跟随（AppDelegate 每帧调用）
 
     func lookToward(dx: Double, dy: Double) {
+        guard !trackingSuspended else { return }
         let scale = 260.0
         let nx = CGFloat(max(-1, min(1, dx / scale)))
         let ny = CGFloat(max(-1, min(1, dy / scale)))
@@ -275,6 +282,72 @@ final class PetSceneView: SCNView, PetRenderer {
         petRoot.runAction(.sequence([.scale(by: 1.06, duration: 0.08), down]))
     }
 
+    /// 抖动（提醒时用）。用左右平移实现，不与眼睛跟随（改 eulerAngles）/呼吸（改 scale）冲突。
+    func playShake() {
+        guard let petRoot else { return }
+        let a: CGFloat = 0.16
+        let t = 0.04
+        let cycle = SCNAction.sequence([
+            .moveBy(x: a, y: 0, z: 0, duration: t),
+            .moveBy(x: -2 * a, y: 0, z: 0, duration: 2 * t),
+            .moveBy(x: 2 * a, y: 0, z: 0, duration: 2 * t),
+            .moveBy(x: -a, y: 0, z: 0, duration: t)
+        ])
+        petRoot.runAction(.repeat(cycle, count: 3), forKey: "shake")
+    }
+
+    /// 跳舞：扭身 + 蹦跳，约 3.5 秒。期间挂起眼睛跟随，结束恢复。
+    func playDance() {
+        guard let petRoot else { return }
+        trackingSuspended = true
+        petRoot.removeAction(forKey: "breath")
+        let twist = SCNAction.sequence([
+            .rotateBy(x: 0, y: 0, z: 0.25, duration: 0.22),
+            .rotateBy(x: 0, y: 0, z: -0.50, duration: 0.40),
+            .rotateBy(x: 0, y: 0, z: 0.25, duration: 0.22)
+        ])
+        let hop = SCNAction.sequence([
+            .moveBy(x: 0, y: 0.22, z: 0, duration: 0.22),
+            .moveBy(x: 0, y: -0.22, z: 0, duration: 0.22)
+        ])
+        petRoot.runAction(.repeat(.group([twist, hop]), count: 4)) { [weak self] in
+            petRoot.eulerAngles = SCNVector3(0, 0, 0)
+            self?.trackingSuspended = false
+            self?.startIdleBreathing()
+        }
+    }
+
+    /// 穿越——"被吸进黑洞"：旋转 + 缩小同步进行（与上层的滑动同时启动，螺旋着被吸入）。
+    /// 缩小用 easeIn：前段保持大、后段才缩没，配合滑动 easeOut 让"移动"清晰可见。
+    func playEnterPortal(completion: @escaping () -> Void) {
+        guard let petRoot else { completion(); return }
+        petRoot.removeAction(forKey: "breath")
+        let spin = SCNAction.rotateBy(x: 0, y: CGFloat.pi * 4, z: 0, duration: 0.7)  // 转 2 圈
+        let shrink = SCNAction.scale(to: 0.01, duration: 0.7); shrink.timingMode = .easeIn
+        petRoot.runAction(.group([spin, shrink]), completionHandler: completion)
+    }
+
+    /// 穿越——"走出黑洞"：从极小放大回原状，恢复呼吸。
+    func playExitPortal() {
+        guard let petRoot else { return }
+        petRoot.eulerAngles = SCNVector3(0, 0, 0)
+        petRoot.scale = SCNVector3(0.01, 0.01, 0.01)
+        let grow = SCNAction.scale(to: 1.0, duration: 0.5); grow.timingMode = .easeOut
+        petRoot.runAction(grow) { [weak self] in
+            self?.startIdleBreathing()
+        }
+    }
+
+    /// 打招呼：左右摆动几下（无骨骼，用整体摆动近似挥手）。
+    func playGreet() {
+        guard let petRoot else { return }
+        let l = SCNAction.rotateBy(x: 0, y: 0, z: 0.22, duration: 0.16)
+        let r = SCNAction.rotateBy(x: 0, y: 0, z: -0.22, duration: 0.16)
+        petRoot.runAction(.sequence([l, r, l, r])) {
+            petRoot.eulerAngles = SCNVector3(0, 0, 0)
+        }
+    }
+
     private func startIdleBreathing() {
         guard let petRoot else { return }
         let inhale = SCNAction.scale(by: 1.015, duration: 1.6); inhale.timingMode = .easeInEaseOut
@@ -291,11 +364,14 @@ final class PetSceneView: SCNView, PetRenderer {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        let now = NSEvent.mouseLocation
+        // 移动超过阈值才算真正拖动；小于则视为微抖动忽略
         if !didDrag {
+            let dx = now.x - dragStartMouse.x, dy = now.y - dragStartMouse.y
+            if dx * dx + dy * dy < 36 { return }   // < 6px 抖动忽略
             didDrag = true
             onIntent?(.dragBegan)
         }
-        let now = NSEvent.mouseLocation
         window?.setFrameOrigin(NSPoint(x: dragStartOrigin.x + (now.x - dragStartMouse.x),
                                        y: dragStartOrigin.y + (now.y - dragStartMouse.y)))
     }
@@ -305,8 +381,10 @@ final class PetSceneView: SCNView, PetRenderer {
             onIntent?(.dragEnded)
         } else if event.clickCount >= 2 {
             onIntent?(.doubleClick)
+            onRawClick?()
         } else {
             onIntent?(.poke)
+            onRawClick?()
         }
     }
 
