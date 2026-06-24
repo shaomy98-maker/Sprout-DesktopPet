@@ -19,6 +19,8 @@ final class PetSceneView: SCNView, PetRenderer {
     private var eyeExprNodes: [SCNNode] = []
     private var eyeExprBase: [SCNVector3] = []      // 各眼睛节点的基准缩放
     private var eyeShift: CGFloat = 0.06            // 眼睛最大平移量
+    private var currentOpenness: CGFloat = 1.0      // 当前表情对应的睁眼程度（眨眼后睁回它）
+    private var blinkTimer: Timer?
     private var eyeSquishAxis = 1                   // 眯眼缩放轴：1=Y(占位/Y-up)，2=Z(真模型/Z-up 的竖直)
 
     /// 真模型里眼睛部件名（由另一版的贴图分析得出；认错就改这里，找不到会用几何启发式兜底）。
@@ -59,6 +61,7 @@ final class PetSceneView: SCNView, PetRenderer {
         buildLights(in: scene)
         buildPet(in: scene)
         startIdleBreathing()
+        startBlinking()
     }
 
     // MARK: - 相机 / 灯光
@@ -230,25 +233,63 @@ final class PetSceneView: SCNView, PetRenderer {
 
     func render(mood: PetMood) {
         currentMood = mood
-        let openness: CGFloat
         switch mood {
-        case .idle, .dragged: openness = 1.0
-        case .happy:          openness = 0.30   // 眯眼笑
-        case .surprised:      openness = 1.35   // 瞪大
-        case .eating:         openness = 0.85
-        case .sleepy:         openness = 0.08   // 闭眼
+        case .idle, .dragged, .sleepy: currentOpenness = 1.0   // 休息也睁眼，靠自然眨眼表现生命感
+        case .happy:                   currentOpenness = 0.30  // 眯眼笑
+        case .surprised:               currentOpenness = 1.35  // 瞪大
+        case .eating:                  currentOpenness = 0.85
         }
+        applyEyeOpenness(currentOpenness, duration: 0.18)
+        applyGesture(for: mood)
+    }
+
+    /// 把眼睛开合程度设为 `o`（1=正常睁开，0≈闭合）。沿“竖直轴”压扁：占位 Y、真模型(Z-up) Z。
+    private func applyEyeOpenness(_ o: CGFloat, duration: CFTimeInterval) {
+        guard !eyeExprNodes.isEmpty else { return }
         SCNTransaction.begin()
-        SCNTransaction.animationDuration = 0.18
+        SCNTransaction.animationDuration = duration
         for (i, n) in eyeExprNodes.enumerated() {
             let b = eyeExprBase[i]
-            // 沿“竖直轴”压扁表达眯/闭眼：占位是 Y，真模型(Z-up)是 Z
             n.scale = eyeSquishAxis == 2
-                ? SCNVector3(b.x, b.y, b.z * openness)
-                : SCNVector3(b.x, b.y * openness, b.z)
+                ? SCNVector3(b.x, b.y, b.z * o)
+                : SCNVector3(b.x, b.y * o, b.z)
         }
         SCNTransaction.commit()
-        applyGesture(for: mood)
+    }
+
+    // MARK: - 自然眨眼（贴近真人频率 ~15-20 次/分钟）
+
+    private func startBlinking() { scheduleNextBlink() }
+
+    private func scheduleNextBlink() {
+        blinkTimer?.invalidate()
+        let interval = Double.random(in: 2.6...5.0)     // 平均约每 3.8 秒一次
+        let t = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            self?.blinkOnce()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        blinkTimer = t
+    }
+
+    /// 一次快速眨眼：闭 ~0.06s、睁回当前表情 ~0.10s；偶尔双眨，更像真人。
+    private func blinkOnce() {
+        guard !trackingSuspended, !eyeExprNodes.isEmpty else { scheduleNextBlink(); return }
+        applyEyeOpenness(0.04, duration: 0.06)          // 闭
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            guard let self else { return }
+            self.applyEyeOpenness(self.currentOpenness, duration: 0.10)   // 睁回当前表情
+            if Double.random(in: 0...1) < 0.12 {        // ~12% 概率双眨
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                    self.applyEyeOpenness(0.04, duration: 0.06)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        self.applyEyeOpenness(self.currentOpenness, duration: 0.10)
+                        self.scheduleNextBlink()
+                    }
+                }
+            } else {
+                self.scheduleNextBlink()
+            }
+        }
     }
 
     private func applyGesture(for mood: PetMood) {
