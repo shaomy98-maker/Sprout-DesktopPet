@@ -1,0 +1,17 @@
+# 编译产物
+.build/
+DerivedData/
+*.o
+*.dSYM/
+
+# 分发产物（安装包、.app）
+dist/
+*.dmg
+*.zip
+
+# macOS
+.DS_Store
+
+# Xcode 用户数据
+xcuserdata/
+*.xcuserstate
