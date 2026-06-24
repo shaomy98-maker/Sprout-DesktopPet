@@ -24,6 +24,8 @@ swift run
 - **架构**：`PetCore`（跨端可复用纯逻辑：表情状态机/协议，含单测）+ `DesktopPet`（macOS 表现层）
 - **模型**：`pet.usdz`（Tripo 生成，运行时原生加载；缺失则退回基础几何体占位形象）
 - **最低系统**：macOS 13
+- <img width="802" height="832" alt="image" src="https://github.com/user-attachments/assets/d26cf035-b507-4c09-93fa-9ea89d05844c" />
+
 
 ## 现状
 
