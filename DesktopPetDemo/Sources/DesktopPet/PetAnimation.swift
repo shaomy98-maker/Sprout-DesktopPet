@@ -17,6 +17,9 @@ enum Ease {
         let p = t - 1
         return 1 + (s + 1) * pow(p, 3) + s * pow(p, 2)
     }
+
+    /// SCNAction.timingFunction 用的 inOutSine（(Float)->Float）。
+    static let inOutSineTiming: (Float) -> Float = { Float(inOutSine(Double($0))) }
 }
 
 extension SCNAction {
@@ -99,4 +102,15 @@ enum Tunables {
     static let danceHopHeight: CGFloat = 0.22   // 小跳高度（调小，别盖过旋转）
     static let danceSquash: CGFloat = 0.12      // 挤压拉伸幅度
     static let danceWindup: CGFloat = 0.30      // 转圈前反向蓄力角度(rad)
+
+    // —— 肢体律动跳舞（关节装配版：胳膊/腿摆动 + 身体律动）——
+    static let danceBeat: Double = 0.45         // 每拍时长
+    static let danceBeats = 8                   // 总拍数
+    static let danceArm: CGFloat = 0.6          // 抬臂摆角(rad ≈34°，别 >50° 否则刚体露缝)
+    static let danceArmFollow: CGFloat = 0.25   // 另一只手的跟随比例
+    static let danceLeg: CGFloat = 0.20         // 腿/脚摆角
+    static let danceLegFollow: CGFloat = 0.6
+    static let danceBodyLean: CGFloat = 0.12    // 身体侧倾(绕 Z)
+    static let danceBodyYaw: CGFloat = 0.10     // 身体小转(绕 Y)
+    static let danceBob: CGFloat = 0.06         // 身体上下 bob
 }

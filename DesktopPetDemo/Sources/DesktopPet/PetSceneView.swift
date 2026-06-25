@@ -70,6 +70,17 @@ final class PetSceneView: SCNView, PetRenderer {
 
     private var isDancing = false
 
+    // 肢体关节装配（把拆分网格的胳膊/腿挂到空关节上，只转关节做刚体摆动）。
+    // 默认取「上方两块=胳膊、底部两脚=腿」——都是末端部件，刚体旋转不易露缝；选错改这 4 个名字即可。
+    // 每个肢体可由多块网格组成（如胳膊=上臂+爪垫），整组挂到同一个关节一起摆。
+    private let limbArmLNames = ["tripo_part_12", "tripo_part_14"]   // 左臂：上臂(绿)+爪垫(红)
+    private let limbArmRNames = ["tripo_part_11", "tripo_part_15"]   // 右臂
+    private let limbLegLNames = ["tripo_part_5"]                     // 左脚
+    private let limbLegRNames = ["tripo_part_6"]                     // 右脚
+    private var jArmL, jArmR, jLegL, jLegR: SCNNode?
+    private var riggedLimbs: [SCNNode] = []          // 已装配的肢体节点（次级运动要排除，避免双重驱动）
+    private var limbRigReady = false
+
     private var dragStartMouse: NSPoint = .zero
     private var dragStartOrigin: NSPoint = .zero
     private var didDrag = false
@@ -139,11 +150,79 @@ final class PetSceneView: SCNView, PetRenderer {
         // 注：pet_dance.usdz（UsdSkel 骨骼）SceneKit 渲染不出，loadDanceModel 已不在加载链上
         //（方法保留备查）；跳舞改为纯刚体部件编排。
         if loadModel(into: petRoot) {
-            collectAppendages()
+            setupLimbRig()      // 把胳膊/腿挂到关节（会 reparent）
+            collectAppendages() // 再选软部件做次级运动（排除已装配肢体）
         } else {
             buildPlaceholderPet()
             collectAppendages()
         }
+    }
+
+    // MARK: - 肢体关节装配（纯刚体）
+
+    /// 把 4 个肢体（每个可由多块网格组成）各挂到一个空关节（肩点/胯点为枢轴），之后只转关节即可摆动整组。
+    private func setupLimbRig() {
+        guard let armL = rigGroup(limbArmLNames, pivot: .shoulder),
+              let armR = rigGroup(limbArmRNames, pivot: .shoulder),
+              let legL = rigGroup(limbLegLNames, pivot: .hip),
+              let legR = rigGroup(limbLegRNames, pivot: .hip) else {
+            NSLog("[RIG] 肢体装配失败，跳舞退回程序化编排"); limbRigReady = false; return
+        }
+        jArmL = armL.joint; jArmR = armR.joint; jLegL = legL.joint; jLegR = legR.joint
+        riggedLimbs = armL.nodes + armR.nodes + legL.nodes + legR.nodes
+        limbRigReady = true
+        NSLog("[Pet] 肢体装配完成 armL=\(limbArmLNames) armR=\(limbArmRNames) legL=\(limbLegLNames) legR=\(limbLegRNames)")
+    }
+
+    private enum PivotKind { case shoulder, hip }
+
+    /// 给一组命名部件建一个关节（位置=合并包围盒的肩/胯枢轴），把整组挂上去并保留各自世界位姿。
+    private func rigGroup(_ names: [String], pivot: PivotKind) -> (joint: SCNNode, nodes: [SCNNode])? {
+        let nodes = names.compactMap { limbNode($0) }
+        guard nodes.count == names.count, !nodes.isEmpty else { return nil }
+        // 合并这组网格在 petRoot 空间的包围盒
+        let big = CGFloat.greatestFiniteMagnitude
+        var lo = SCNVector3(big, big, big)
+        var hi = SCNVector3(-big, -big, -big)
+        for n in nodes {
+            guard let b = partBoundsInRoot(n) else { return nil }
+            lo = SCNVector3(Swift.min(lo.x, b.bmin.x), Swift.min(lo.y, b.bmin.y), Swift.min(lo.z, b.bmin.z))
+            hi = SCNVector3(Swift.max(hi.x, b.bmax.x), Swift.max(hi.y, b.bmax.y), Swift.max(hi.z, b.bmax.z))
+        }
+        let cx = (lo.x + hi.x) / 2, cz = (lo.z + hi.z) / 2
+        let p: SCNVector3
+        switch pivot {
+        case .shoulder: p = SCNVector3(cx > 0 ? lo.x : hi.x, hi.y, cz)   // 上方、靠中线那角
+        case .hip:      p = SCNVector3(cx, hi.y, cz)                     // 上方中点
+        }
+        let j = SCNNode(); j.name = "j_" + (names.first ?? "limb"); j.position = p
+        petRoot.addChildNode(j)
+        for n in nodes {
+            guard let parent = n.parent else { continue }
+            let t = j.convertTransform(n.transform, from: parent)   // 先在关节空间表达世界位姿
+            j.addChildNode(n)
+            n.transform = t
+        }
+        return (j, nodes)
+    }
+
+    private func limbNode(_ name: String) -> SCNNode? { petRoot.childNode(withName: name, recursively: true) }
+
+    /// 命名部件（多为无几何的 Xform，几何在子节点）在 petRoot 空间的包围盒。
+    private func partBoundsInRoot(_ named: SCNNode) -> (center: SCNVector3, bmin: SCNVector3, bmax: SCNVector3)? {
+        var geo: SCNNode? = named.geometry != nil ? named : nil
+        if geo == nil {
+            named.enumerateHierarchy { n, stop in
+                if n.geometry != nil { geo = n; stop.pointee = true }
+            }
+        }
+        guard let g = geo else { return nil }
+        let (lmin, lmax) = g.boundingBox
+        let c = g.convertPosition(SCNVector3((lmin.x + lmax.x)/2, (lmin.y + lmax.y)/2, (lmin.z + lmax.z)/2), to: petRoot)
+        let a = g.convertPosition(lmin, to: petRoot), d = g.convertPosition(lmax, to: petRoot)
+        let bmin = SCNVector3(Swift.min(a.x, d.x), Swift.min(a.y, d.y), Swift.min(a.z, d.z))
+        let bmax = SCNVector3(Swift.max(a.x, d.x), Swift.max(a.y, d.y), Swift.max(a.z, d.z))
+        return (c, bmin, bmax)
     }
 
     /// 通用加载：reparent → Z-up 扶正 + 面向镜头 → 双面修复 → 归一化居中。返回容器节点。
@@ -410,10 +489,16 @@ final class PetSceneView: SCNView, PetRenderer {
         }
         guard parts.count >= 2 else { return [] }
         let eyeSet = Set(eyeFollowNodes.map { ObjectIdentifier($0) })
+        let limbSet = Set(riggedLimbs.map { ObjectIdentifier($0) })
+        func underLimb(_ n: SCNNode) -> Bool {
+            var cur: SCNNode? = n
+            while let c = cur { if limbSet.contains(ObjectIdentifier(c)) { return true }; cur = c.parent }
+            return false
+        }
         let radii = parts.map { $0.r }.sorted()
         let medR = radii[radii.count / 2]
         return parts
-            .filter { $0.r <= medR * 1.05 && !eyeSet.contains(ObjectIdentifier($0.node)) }
+            .filter { $0.r <= medR * 1.05 && !eyeSet.contains(ObjectIdentifier($0.node)) && !underLimb($0.node) }
             .sorted { $0.r < $1.r }                       // 最小的优先（最像软挂件）
             .prefix(Tunables.secondaryMaxParts)
             .map { $0.node }
@@ -545,29 +630,102 @@ final class PetSceneView: SCNView, PetRenderer {
         petRoot.runAction(.repeat(cycle, count: 3), forKey: "shake")
     }
 
-    /// 触发跳舞：一段约 5 秒、纯刚体部件编排的萌舞——
-    /// 左右摇摆 groove → 点头(过冲) → 小跳 → 扭身(inOutSine) → 小跳 → 缓动转圈收尾(反向蓄力+回弹)。
-    /// 旋转幅度做足以读出"在跳舞"、竖直小跳收小别盖过旋转；全程冻结呼吸、挂起跟手，耳朵/围巾/铃铛
-    /// 由次级运动自动跟着甩；结束平滑回待机。可反复触发（打断重跳）。
+    /// 触发跳舞（纯刚体）：装配好胳膊/腿则走「肢体律动版」——胳膊上下摆、腿轻摆 + 身体侧倾/上下 bob，
+    /// 交替 N 拍；未装配则退回「整体程序化编排」（摇摆→点头→跳→扭→跳→转圈）。
+    /// 全程冻结呼吸、挂起跟手；软部件由次级运动跟着甩；结束平滑回待机。可反复触发（打断重跳）。
     func dance(loop: Bool = false) {
         guard let petRoot else { return }
         petRoot.removeAction(forKey: "dance")               // 允许重复触发：打断上一段
+        petRoot.removeAction(forKey: "lean")
         petRoot.eulerAngles = SCNVector3(0, 0, 0)           // 从干净姿态起跳，避免相对动作累积漂移
         petRoot.position = SCNVector3(0, 0, 0)
         petRoot.scale = SCNVector3(1, 1, 1)
         isDancing = true
         trackingSuspended = true
 
-        // 编排：先左右摇摆 groove（最像跳舞）→ 点头 → 小跳 → 扭身 → 小跳 → 转圈收尾
-        let routine = SCNAction.sequence([swayBeats(), nodBeats(), hopBeat(), twistBeats(), hopBeat(), spinBeat()])
+        // 装配好胳膊/腿 → 肢体律动版；否则退回整体程序化编排
+        let routine: SCNAction = limbRigReady ? limbRoutine() : proceduralRoutine()
         let body: SCNAction = loop ? .repeatForever(routine) : routine
         petRoot.runAction(body, forKey: "dance") { [weak self] in
             petRoot.eulerAngles = SCNVector3(0, 0, 0)
             petRoot.position = SCNVector3(0, 0, 0)
             petRoot.scale = SCNVector3(1, 1, 1)
+            self?.restLimbs()
             self?.isDancing = false
             self?.trackingSuspended = false
         }
+    }
+
+    // MARK: 肢体律动版（关节摆动 + 身体律动）
+
+    private typealias Pose = [(SCNNode, SCNVector3)]
+
+    /// N 拍交替左右姿势：每拍 tween 关节到 poseLeft/right，同时 petRoot 做侧倾 + 上下 bob。
+    private func limbRoutine() -> SCNAction {
+        let beat = Tunables.danceBeat
+        var steps: [SCNAction] = []
+        for i in 0 ..< Tunables.danceBeats {
+            let left = (i % 2 == 0)
+            steps.append(.run { [weak self] _ in
+                guard let self else { return }
+                self.tween(left ? self.poseLeft() : self.poseRight(), dur: beat, ease: Ease.inOutSineTiming)
+                self.petRoot?.runAction(self.bodyLean(left ? -1 : 1, beat: beat), forKey: "lean")
+            })
+            steps.append(.wait(duration: beat))
+        }
+        return .sequence(steps)
+    }
+
+    /// 向左律动：右臂上摆、左臂轻抬、双腿反向轻摆（poseRight 为其镜像）。
+    private func poseLeft() -> Pose {
+        guard let aL = jArmL, let aR = jArmR, let lL = jLegL, let lR = jLegR else { return [] }
+        let arm = Tunables.danceArm, leg = Tunables.danceLeg
+        return [(aR, SCNVector3(0, 0, arm)), (aL, SCNVector3(0, 0, arm * Tunables.danceArmFollow)),
+                (lL, SCNVector3(leg, 0, 0)), (lR, SCNVector3(-leg * Tunables.danceLegFollow, 0, 0))]
+    }
+    private func poseRight() -> Pose {
+        guard let aL = jArmL, let aR = jArmR, let lL = jLegL, let lR = jLegR else { return [] }
+        let arm = Tunables.danceArm, leg = Tunables.danceLeg
+        return [(aL, SCNVector3(0, 0, -arm)), (aR, SCNVector3(0, 0, -arm * Tunables.danceArmFollow)),
+                (lR, SCNVector3(leg, 0, 0)), (lL, SCNVector3(-leg * Tunables.danceLegFollow, 0, 0))]
+    }
+
+    /// 把每个关节 tween 到目标欧拉角（绝对角，走最短弧）。
+    private func tween(_ pose: Pose, dur: Double, ease: @escaping (Float) -> Float) {
+        for (n, e) in pose {
+            let a = SCNAction.rotateTo(x: CGFloat(e.x), y: CGFloat(e.y), z: CGFloat(e.z),
+                                       duration: dur, usesShortestUnitArc: true)
+            a.timingFunction = ease
+            n.runAction(a)
+        }
+    }
+
+    /// 身体律动：侧倾(绕 Z) + 小转(绕 Y) + 半拍下沉半拍回升的 bob。s=±1 决定左右。
+    private func bodyLean(_ s: CGFloat, beat: Double) -> SCNAction {
+        let g = SCNAction.group([
+            SCNAction.rotateTo(x: 0, y: Tunables.danceBodyYaw * s, z: Tunables.danceBodyLean * s,
+                               duration: beat, usesShortestUnitArc: true),
+            SCNAction.sequence([
+                SCNAction.moveBy(x: 0, y: Tunables.danceBob, z: 0, duration: beat / 2),
+                SCNAction.moveBy(x: 0, y: -Tunables.danceBob, z: 0, duration: beat / 2)
+            ])
+        ])
+        g.timingMode = .easeInEaseOut
+        return g
+    }
+
+    /// 关节回到 0（结束/打断时复位肢体）。
+    private func restLimbs() {
+        let pose: Pose = [jArmL, jArmR, jLegL, jLegR].compactMap { $0 }.map { ($0, SCNVector3Zero) }
+        guard !pose.isEmpty else { return }
+        tween(pose, dur: 0.3, ease: Ease.inOutSineTiming)
+    }
+
+    // MARK: 程序化整体编排（无肢体装配时的兜底）
+
+    /// 摇摆→点头→小跳→扭身→小跳→转圈收尾。
+    private func proceduralRoutine() -> SCNAction {
+        .sequence([swayBeats(), nodBeats(), hopBeat(), twistBeats(), hopBeat(), spinBeat()])
     }
 
     /// 左右摇摆 groove：身体侧倾(绕 Z) + 每拍轻微下沉，像踩拍子摇摆——最能读出"在跳舞"。净旋转/位移 0。
