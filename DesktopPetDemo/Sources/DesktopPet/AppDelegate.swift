@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?               // 60Hz 追踪定时器
     private var reminderTimer: Timer?       // 提醒定时器
+    private var lastTickUptime: TimeInterval = 0   // 上帧时刻（算 dt 用，单调时钟）
 
     // 表情状态机（Domain 层，纯逻辑）
     private let machine = PetStateMachine()
@@ -31,7 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var circlePrevAngle: CGFloat?
     private var circleLastTime = Date.distantPast
     private var menuCooldownUntil = Date.distantPast
-    private let circlesToOpen: CGFloat = 2.5
+    private let circlesToOpen: CGFloat = 3
 
     // 连点 N 次关闭
     private var clickCount = 0
@@ -95,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "戳一戳", action: #selector(poke), keyEquivalent: "")
         menu.addItem(withTitle: "摸摸", action: #selector(pet), keyEquivalent: "")
         menu.addItem(withTitle: "喂食", action: #selector(feed), keyEquivalent: "")
+        menu.addItem(withTitle: "跳舞", action: #selector(danceMenu), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "试一下提醒", action: #selector(testReminder), keyEquivalent: "")
         menu.addItem(withTitle: "回到右下角", action: #selector(resetPosition), keyEquivalent: "")
@@ -107,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func poke() { dispatch(.poke) }
     @objc private func pet()  { dispatch(.pet) }
     @objc private func feed() { dispatch(.feed) }
+    @objc private func danceMenu() { startDance() }
     @objc private func resetPosition() {
         guard let screen = NSScreen.main else { return }
         let vf = screen.visibleFrame
@@ -164,13 +167,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             circleAccum = 0; circlePrevAngle = nil
         }
 
-        // 以脑袋为圆心（窗口中心略上移）
-        let center = NSPoint(x: window.frame.midX, y: window.frame.midY + 50)
+        // 以宠物身体为圆心（窗口中心）
+        let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
         let dx = mouse.x - center.x, dy = mouse.y - center.y
         let dist = sqrt(dx * dx + dy * dy)
 
-        // 放宽判定环带；离开只断开连续性，短暂越界不丢进度
-        let rMin: CGFloat = 18, rMax: CGFloat = 320
+        // 大幅放宽判定环带：贴着身体绕 / 离得较远绕都算；离开只断开连续性，短暂越界不丢进度
+        let rMin: CGFloat = 8, rMax: CGFloat = 420
         guard dist >= rMin, dist <= rMax else {
             circlePrevAngle = nil
             return
@@ -210,13 +213,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 跳舞
 
     private func startDance() {
-        guard !isBusy else { return }
-        isBusy = true
         bubble.show("看我跳个舞～ 💃", abovePet: window.frame)
-        sceneView.playDance()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.6) { [weak self] in
-            self?.isBusy = false
-        }
+        sceneView.dance()   // 纯刚体部件编排的萌舞；可反复触发（打断重跳）
     }
 
     // MARK: - 穿越（黑洞传送）
@@ -351,12 +349,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mouse = NSEvent.mouseLocation
         let overPet = isMouseOverPet(screenPoint: mouse)
 
-        // 2) 让宠物眼睛看向鼠标（打盹闭眼时不追踪，让摇摆动作接管姿态）
-        if machine.mood != .sleepy {
+        // 2) 头/眼跟随鼠标（打盹时不追踪）+ 每帧推进动画引擎（弹簧/待机噪声/次级运动）
+        let track = machine.mood != .sleepy
+        sceneView.setLookActive(track)
+        if track {
             let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
             sceneView.lookToward(dx: Double(mouse.x - center.x),
                                  dy: Double(mouse.y - center.y))
         }
+        // 每帧推进动画引擎，传入真实 dt（首帧与卡顿后做 clamp，避免一帧跳变过大）
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = lastTickUptime == 0 ? 1.0 / 60.0 : min(0.1, max(0.0, now - lastTickUptime))
+        lastTickUptime = now
+        sceneView.tick(dt: CGFloat(dt))
 
         // 3) 点击穿透：只有鼠标真正落在宠物身上时才接收事件，否则穿透到下层应用
         window.ignoresMouseEvents = !overPet
